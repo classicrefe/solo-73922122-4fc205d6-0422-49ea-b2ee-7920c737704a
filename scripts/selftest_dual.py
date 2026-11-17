@@ -204,14 +204,77 @@ def main() -> None:
         files = list((data_dir / "parquet").glob("*.parquet"))
         check("拒绝的上传未留下 Parquet", len(files) == 2, [p.name for p in files])
 
+        # 6b. 站点区域时间轴：整批维护、左闭右开、空档为空
+        segments = [
+            {"start": "2026-01-01T00:00:00Z", "end": "2026-02-01T00:00:00Z", "region_code": "华北"},
+        ]
+        saved = httpx.post(
+            f"{B}/api/regions/54511", json={"revision": 0, "segments": segments}, timeout=30
+        )
+        check("在 B 提交站点区域时间轴", saved.status_code == 200, saved.text[:160])
+        check("时间轴修订号为 r1", saved.json()["revision"] == 1)
+        view = httpx.get(f"{A}/api/batches/{old['id']}").json()
+        check("A 按精确时刻匹配区域（区间内）", view["region_codes"][0] == "华北", view["region_codes"])
+        check("A 无时间轴站点归属为空", view["region_codes"][1] is None, view["region_codes"])
+        check("原 Parquet 仍未被改写",
+              old_path.read_bytes() == before_bytes and old_path.stat().st_mtime_ns == before_mtime)
+
+        # 6c. 双实例同版本修订：只准一次成功，旧时间轴保持
+        results = []
+
+        def revise(url: str, code: str) -> None:
+            results.append(
+                httpx.post(
+                    f"{url}/api/regions/54511",
+                    json={"revision": 1, "segments": [
+                        {"start": "2026-01-01T00:00:00Z", "end": "2026-02-01T00:00:00Z",
+                         "region_code": code}
+                    ]},
+                    timeout=30,
+                )
+            )
+
+        threads = [
+            threading.Thread(target=revise, args=(A, "华东")),
+            threading.Thread(target=revise, args=(B, "华南")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        codes = sorted(r.status_code for r in results)
+        check("同版本区域修订：一成功一冲突", codes == [200, 409], codes)
+        winner = next(r for r in results if r.status_code == 200).json()["segments"][0]["region_code"]
+        timeline = httpx.get(f"{A}/api/regions/54511").json()
+        check("冲突不改变已提交时间轴",
+              timeline["revision"] == 2 and timeline["segments"][0]["region_code"] == winner,
+              timeline)
+
         # 7. 下载与完整性
         csv_dl = httpx.get(f"{A}/api/batches/{new.json()['id']}?format=csv")
         expected_header = httpx.get(f"{A}/api/schema").json()
-        names = ["station_id", "observed_at"] + [f["name"] for f in expected_header["fields"]]
-        check("下载按当前列名 CSV", csv_dl.status_code == 200 and csv_dl.text.splitlines()[0] == ",".join(names),
+        names = ["station_id", "observed_at"] + [f["name"] for f in expected_header["fields"]] + ["region_code"]
+        check("下载按当前列名 + 区域列 CSV",
+              csv_dl.status_code == 200 and csv_dl.text.splitlines()[0] == ",".join(names),
               csv_dl.text.splitlines()[0])
+        new_dl = httpx.get(f"{A}/api/batches/{new.json()['id']}").json()
+        check("右端开区间：观测时刻等于结束时刻归属为空",
+              new_dl["region_codes"] == [None], new_dl["region_codes"])
+        gap = httpx.post(
+            f"{A}/api/regions/54511",
+            json={"revision": 2, "segments": [
+                {"start": "2026-01-01T06:00:00Z", "end": "2026-02-01T00:00:00Z",
+                 "region_code": winner}
+            ]},
+            timeout=30,
+        )
+        check("缩短区间制造空档", gap.status_code == 200, gap.text[:120])
+        check("空档内观测时刻归属为空",
+              httpx.get(f"{A}/api/batches/{old['id']}").json()["region_codes"][0] is None)
+        check("空档不影响原 Parquet",
+              old_path.read_bytes() == before_bytes and old_path.stat().st_mtime_ns == before_mtime)
         pq_dl = httpx.get(f"{A}/api/batches/{new.json()['id']}?format=parquet")
-        check("下载当前列名 Parquet", pq_dl.status_code == 200 and len(pq_dl.content) > 100)
+        check("下载当前列名 Parquet（不含区域列）", pq_dl.status_code == 200 and len(pq_dl.content) > 100)
         integrity = httpx.get(f"{A}/api/integrity").json()
         check("双实例一致性自检", integrity["ok"] and integrity["batches"] == 2, integrity)
         page = httpx.get(f"{B}/")

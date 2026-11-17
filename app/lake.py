@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import bisect
 import csv
 import hashlib
 import io
@@ -27,8 +28,8 @@ import time
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
@@ -42,14 +43,22 @@ MAX_ROWS = 1000
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_STATION_LENGTH = 256
 MAX_FIELD_NAME_LENGTH = 64
+MAX_REGION_SEGMENTS = 20
+MAX_REGION_CODE_LENGTH = 64
 
 STATION_COLUMN = "station_id"
 TIME_COLUMN = "observed_at"
-RESERVED_NAMES = {STATION_COLUMN.casefold(), TIME_COLUMN.casefold()}
+REGION_COLUMN = "region_code"
+RESERVED_NAMES = {
+    STATION_COLUMN.casefold(),
+    TIME_COLUMN.casefold(),
+    REGION_COLUMN.casefold(),
+}
 FIELD_ID_RE = re.compile(r"^f_[0-9a-f]{32}$")
 INT_RE = re.compile(r"^[+-]?\d+$")
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 SCHEMA_VERSION_KEY = "schema_version"
 UPLOAD_METADATA_PREFIX = b"metlake."
@@ -77,6 +86,23 @@ class StaleSchema(LakeError):
         super().__init__(
             f"结构版本已过期：本次操作基于 v{expected}，当前已提交结构为 v{actual}。"
             "为避免旧结构写入，整次操作已被拒绝，请刷新页面后重试。"
+        )
+
+
+class StaleRegion(LakeError):
+    """站点区域时间轴的修订号冲突。"""
+
+    status_code = 409
+    code = "stale_region"
+
+    def __init__(self, station_id: str, expected: int, actual: int) -> None:
+        self.station_id = station_id
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"站点 {station_id} 的区域归属已过期：本次操作基于修订 r{expected}，"
+            f"当前已提交修订为 r{actual}。整次操作已被拒绝，旧时间轴保持不变；"
+            "请刷新后重试。"
         )
 
 
@@ -168,9 +194,31 @@ class Batch:
 
 
 @dataclass(frozen=True)
+class RegionSegment:
+    """一段 UTC 左闭右开有效区间：``start <= t < end``。"""
+
+    start: datetime
+    end: datetime
+    region_code: str
+
+
+@dataclass(frozen=True)
+class RegionTimeline:
+    station_id: str
+    revision: int
+    segments: tuple[RegionSegment, ...]
+    updated_at: str | None = None
+
+    @property
+    def segment_count(self) -> int:
+        return len(self.segments)
+
+
+@dataclass(frozen=True)
 class LakeState:
     schema: Schema
     batches: tuple[Batch, ...]
+    regions: tuple[RegionTimeline, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -178,6 +226,14 @@ class BatchView:
     schema: Schema
     batch: Batch
     table: pa.Table
+    assignment_table: pa.Table | None = None
+    regions: dict[str, "RegionTimeline"] = field(default_factory=dict)
+
+    @property
+    def preview_table(self) -> pa.Table:
+        """预览 / CSV 导出用：当前测量列 + 区域归属列。"""
+
+        return self.assignment_table if self.assignment_table is not None else self.table
 
 
 @dataclass(frozen=True)
@@ -295,6 +351,34 @@ def initialize(settings: Settings) -> None:
                 "ON batches(created_at DESC)"
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS region_timelines (
+                    station_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL CHECK (revision >= 0),
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS region_segments (
+                    station_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL CHECK (seq >= 0),
+                    start_us INTEGER NOT NULL,
+                    end_us INTEGER NOT NULL,
+                    region_code TEXT NOT NULL,
+                    PRIMARY KEY (station_id, seq),
+                    FOREIGN KEY (station_id)
+                        REFERENCES region_timelines(station_id) ON DELETE CASCADE,
+                    CHECK (start_us < end_us)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_region_segments_station_start "
+                "ON region_segments(station_id, start_us)"
+            )
+            conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, '0')",
                 (SCHEMA_VERSION_KEY,),
             )
@@ -406,7 +490,7 @@ def _query_schema(conn: sqlite3.Connection) -> Schema:
 
 
 def read_state(settings: Settings) -> LakeState:
-    """在一个读事务中取得一致的结构 + 批次登记快照。"""
+    """在一个读事务中取得一致的结构 + 批次登记 + 区域时间轴快照。"""
 
     try:
         with _read_transaction(settings) as conn:
@@ -417,9 +501,10 @@ def read_state(settings: Settings) -> LakeState:
                 "ORDER BY created_at DESC, id DESC"
             ).fetchall()
             batches = tuple(_rows_to_batch(r) for r in rows)
+            regions = _query_region_timelines(conn)
     except sqlite3.Error as exc:
         raise StorageError("读取数据湖状态失败。") from exc
-    return LakeState(schema=schema, batches=batches)
+    return LakeState(schema=schema, batches=batches, regions=regions)
 
 
 def read_schema(settings: Settings) -> Schema:
@@ -428,6 +513,280 @@ def read_schema(settings: Settings) -> Schema:
             return _query_schema(conn)
     except sqlite3.Error as exc:
         raise StorageError("读取结构失败。") from exc
+
+
+# ---------------------------------------------------------------------------
+# 站点区域时间轴
+# ---------------------------------------------------------------------------
+
+
+def normalize_station_id(raw: object) -> str:
+    if raw is None:
+        raise ValidationError("站号不能为空。")
+    station = str(raw).strip()
+    if not station:
+        raise ValidationError("站号不能为空。")
+    if len(station) > MAX_STATION_LENGTH:
+        raise ValidationError(f"站号最长 {MAX_STATION_LENGTH} 个字符。")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in station):
+        raise ValidationError("站号不能包含控制字符。")
+    return station
+
+
+def _to_epoch_us(value: datetime) -> int:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return (value - EPOCH) // timedelta(microseconds=1)
+
+
+def _from_epoch_us(value: int) -> datetime:
+    return EPOCH + timedelta(microseconds=int(value))
+
+
+def parse_region_time(raw_start: object, raw_end: object, row_no: int) -> tuple[int, int]:
+    """把一段区间的起止解析为 UTC 微秒；返回半开区间 [start, end)。"""
+
+    if raw_start is None or str(raw_start).strip() == "":
+        raise ValidationError(f"第 {row_no} 段缺少开始时刻。")
+    if raw_end is None or str(raw_end).strip() == "":
+        raise ValidationError(f"第 {row_no} 段缺少结束时刻。")
+    try:
+        start = datetime.fromisoformat(str(raw_start).strip().replace("Z", "+00:00"))
+        end = datetime.fromisoformat(str(raw_end).strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValidationError(
+            f"第 {row_no} 段的起止时刻必须是 ISO 8601 格式（UTC）。"
+        ) from None
+    start_us = _to_epoch_us(start)
+    end_us = _to_epoch_us(end)
+    if start_us >= end_us:
+        raise ValidationError(
+            f"第 {row_no} 段的开始时刻必须早于结束时刻（左闭右开区间不能为空）。"
+        )
+    return start_us, end_us
+
+
+def normalize_region_code(raw: object, row_no: int) -> str:
+    if raw is None or str(raw).strip() == "":
+        raise ValidationError(f"第 {row_no} 段缺少区域代码。")
+    code = unicodedata.normalize("NFC", str(raw).strip())
+    if len(code) > MAX_REGION_CODE_LENGTH:
+        raise ValidationError(
+            f"第 {row_no} 段区域代码最长 {MAX_REGION_CODE_LENGTH} 个字符。"
+        )
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in code):
+        raise ValidationError(f"第 {row_no} 段区域代码不能包含控制字符。")
+    return code
+
+
+def parse_region_segments(raw_segments: object) -> tuple[tuple[int, int, str], ...]:
+    """校验并排序区域段；返回 ``(start_us, end_us, region_code)``。"""
+
+    if not isinstance(raw_segments, (list, tuple)):
+        raise ValidationError("区域段必须是数组。")
+    if len(raw_segments) > MAX_REGION_SEGMENTS:
+        raise ValidationError(f"每个站点最多维护 {MAX_REGION_SEGMENTS} 段区域区间。")
+
+    parsed: list[tuple[int, int, str]] = []
+    for index, item in enumerate(raw_segments, start=1):
+        if not isinstance(item, dict):
+            raise ValidationError(f"第 {index} 段格式无效，必须是对象。")
+        start_us, end_us = parse_region_time(
+            item.get("start", item.get("start_at")),
+            item.get("end", item.get("end_at")),
+            index,
+        )
+        code = normalize_region_code(
+            item.get("region_code", item.get("region")), index
+        )
+        parsed.append((start_us, end_us, code))
+
+    parsed.sort(key=lambda item: (item[0], item[1]))
+    previous_end: int | None = None
+    for index, (start_us, end_us, _code) in enumerate(parsed, start=1):
+        if previous_end is not None and start_us < previous_end:
+            raise ValidationError(
+                f"第 {index} 段与上一段区间重叠；同一站点的有效区间不得重叠。"
+            )
+        previous_end = end_us if previous_end is None else max(previous_end, end_us)
+    return tuple(parsed)
+
+
+def _query_region_segments(
+    conn: sqlite3.Connection, station_id: str
+) -> tuple[RegionSegment, ...]:
+    rows = conn.execute(
+        "SELECT start_us, end_us, region_code FROM region_segments "
+        "WHERE station_id = ? ORDER BY start_us ASC, end_us ASC",
+        (station_id,),
+    ).fetchall()
+    return tuple(
+        RegionSegment(
+            start=_from_epoch_us(r["start_us"]),
+            end=_from_epoch_us(r["end_us"]),
+            region_code=r["region_code"],
+        )
+        for r in rows
+    )
+
+
+def _query_region_timelines(
+    conn: sqlite3.Connection, station_id: str | None = None
+) -> tuple[RegionTimeline, ...]:
+    if station_id is None:
+        rows = conn.execute(
+            "SELECT station_id, revision, updated_at FROM region_timelines "
+            "ORDER BY station_id ASC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT station_id, revision, updated_at FROM region_timelines "
+            "WHERE station_id = ?",
+            (station_id,),
+        ).fetchall()
+    return tuple(
+        RegionTimeline(
+            station_id=r["station_id"],
+            revision=int(r["revision"]),
+            segments=_query_region_segments(conn, r["station_id"]),
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    )
+
+
+def read_regions(settings: Settings) -> tuple[RegionTimeline, ...]:
+    try:
+        with _read_transaction(settings) as conn:
+            return _query_region_timelines(conn)
+    except sqlite3.Error as exc:
+        raise StorageError("读取区域时间轴失败。") from exc
+
+
+def read_region(settings: Settings, station_id: str) -> RegionTimeline:
+    station = normalize_station_id(station_id)
+    try:
+        with _read_transaction(settings) as conn:
+            timelines = _query_region_timelines(conn, station)
+    except sqlite3.Error as exc:
+        raise StorageError("读取区域时间轴失败。") from exc
+    if timelines:
+        return timelines[0]
+    return RegionTimeline(station_id=station, revision=0, segments=())
+
+
+def set_region_timeline(
+    settings: Settings,
+    station_id: str,
+    expected_revision: int,
+    raw_segments: object,
+) -> RegionTimeline:
+    """整批替换某站点的区域时间轴。
+
+    写入在 ``BEGIN IMMEDIATE`` 中完成；若另一实例已用同一修订号提交，
+    整次拒绝并保留旧时间轴。
+    """
+
+    station = normalize_station_id(station_id)
+    segments = parse_region_segments(raw_segments)
+    updated_at = _utc_now_iso()
+    try:
+        with _write_transaction(settings) as conn:
+            row = conn.execute(
+                "SELECT revision FROM region_timelines WHERE station_id = ?",
+                (station,),
+            ).fetchone()
+            actual = int(row["revision"]) if row is not None else 0
+            if expected_revision != actual:
+                raise StaleRegion(station, expected_revision, actual)
+            new_revision = actual + 1
+            conn.execute(
+                "INSERT INTO region_timelines(station_id, revision, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(station_id) DO UPDATE SET "
+                "revision = excluded.revision, updated_at = excluded.updated_at",
+                (station, new_revision, updated_at),
+            )
+            conn.execute(
+                "DELETE FROM region_segments WHERE station_id = ?", (station,)
+            )
+            conn.executemany(
+                "INSERT INTO region_segments(station_id, seq, start_us, end_us, "
+                "region_code) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (station, seq, start_us, end_us, code)
+                    for seq, (start_us, end_us, code) in enumerate(segments)
+                ],
+            )
+            log.info(
+                "region timeline %s committed r%s (%s segments)",
+                station,
+                new_revision,
+                len(segments),
+            )
+    except LakeError:
+        raise
+    except sqlite3.Error as exc:
+        raise StorageError("保存区域时间轴失败，原时间轴未改变。") from exc
+
+    return RegionTimeline(
+        station_id=station,
+        revision=new_revision,
+        segments=tuple(
+            RegionSegment(
+                start=_from_epoch_us(start_us),
+                end=_from_epoch_us(end_us),
+                region_code=code,
+            )
+            for start_us, end_us, code in segments
+        ),
+        updated_at=updated_at,
+    )
+
+
+def lookup_region(
+    timeline: RegionTimeline | None, observed_at_us: int
+) -> str | None:
+    """在时间轴中查找精确时刻的归属；空档返回 None。"""
+
+    if timeline is None or not timeline.segments:
+        return None
+    starts = [_to_epoch_us(segment.start) for segment in timeline.segments]
+    index = bisect.bisect_right(starts, observed_at_us) - 1
+    if index < 0:
+        return None
+    segment = timeline.segments[index]
+    if observed_at_us < _to_epoch_us(segment.end):
+        return segment.region_code
+    return None
+
+
+def _with_region_column(
+    table: pa.Table, timelines: dict[str, RegionTimeline]
+) -> pa.Table:
+    """按站号 + 精确观测时刻追加 ``region_code``；空档 / 无时间轴为 NULL。"""
+
+    if REGION_COLUMN in table.column_names:
+        raise BatchIntegrityError(
+            f"当前测量列名与保留的归属列 {REGION_COLUMN} 冲突，请先重命名该测量列。"
+        )
+    stations = table.column(STATION_COLUMN).combine_chunks().to_pylist()
+    observed = table.column(TIME_COLUMN).combine_chunks().to_pylist()
+    cache: dict[tuple[str, int], str | None] = {}
+    codes: list[str | None] = []
+    for station, moment in zip(stations, observed):
+        if moment is None:
+            codes.append(None)
+            continue
+        moment_us = _to_epoch_us(moment)
+        key = (str(station), moment_us)
+        if key not in cache:
+            cache[key] = lookup_region(timelines.get(str(station)), moment_us)
+        codes.append(cache[key])
+    arrays = [table.column(name).combine_chunks() for name in table.column_names]
+    arrays.append(pa.array(codes, type=pa.string()))
+    return pa.Table.from_arrays(arrays, names=[*table.column_names, REGION_COLUMN])
 
 
 # ---------------------------------------------------------------------------
@@ -964,7 +1323,7 @@ def _commit_batch(
 
 
 def get_batch(settings: Settings, batch_id: str) -> BatchView:
-    """读取批次；结构快照与批次登记来自同一个已提交读事务。"""
+    """读取批次；结构、批次登记与区域时间轴来自同一个已提交读事务。"""
 
     try:
         with _read_transaction(settings) as conn:
@@ -974,6 +1333,9 @@ def get_batch(settings: Settings, batch_id: str) -> BatchView:
                 "file_sha256, schema_json FROM batches WHERE id = ?",
                 (batch_id,),
             ).fetchone()
+            timelines = (
+                _query_region_timelines(conn) if row is not None else ()
+            )
     except sqlite3.Error as exc:
         raise StorageError("读取批次失败。") from exc
 
@@ -982,7 +1344,24 @@ def get_batch(settings: Settings, batch_id: str) -> BatchView:
     batch = _rows_to_batch(row)
     physical = _read_physical_table(settings, batch)
     current = _materialize_current_table(physical, schema)
-    return BatchView(schema=schema, batch=batch, table=current)
+    timelines_by_station = {t.station_id: t for t in timelines}
+    assigned = _with_region_column(current, timelines_by_station)
+    used = {
+        str(station)
+        for station in current.column(STATION_COLUMN).combine_chunks().to_pylist()
+    }
+    regions = {
+        station: timelines_by_station[station]
+        for station in used
+        if station in timelines_by_station
+    }
+    return BatchView(
+        schema=schema,
+        batch=batch,
+        table=current,
+        assignment_table=assigned,
+        regions=regions,
+    )
 
 
 def _read_physical_table(settings: Settings, batch: Batch) -> pa.Table:
@@ -1062,6 +1441,16 @@ def format_utc(value: datetime) -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def format_utc_precise(value: datetime) -> str:
+    """区域边界用：保留微秒精度，保证页面/API 往返不改变已提交区间。"""
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    value = value.astimezone(timezone.utc)
+    timespec = "microseconds" if value.microsecond else "seconds"
+    return value.isoformat(timespec=timespec).replace("+00:00", "Z")
 
 
 def display_cell(value: object) -> str | None:

@@ -135,8 +135,11 @@ def test_rename_keeps_values_and_does_not_rewrite_file(client: TestClient, setti
 
     csv_resp = client.get(f"/api/batches/{batch['id']}?format=csv")
     assert csv_resp.status_code == 200
-    assert csv_resp.text.splitlines()[0] == "station_id,observed_at,temperature_c"
-    assert ",21" in csv_resp.text
+    assert (
+        csv_resp.text.splitlines()[0]
+        == "station_id,observed_at,temperature_c,region_code"
+    )
+    assert ",21," in csv_resp.text
 
 
 def test_delete_then_readd_same_name_does_not_leak_values(client: TestClient, settings: Settings):
@@ -413,6 +416,384 @@ def test_registration_failure_removes_new_file(client: TestClient, settings: Set
     assert resp.status_code == 500
     assert list(settings.parquet_dir.glob("*.parquet")) == []
     assert current(client)["batches"] == []
+
+
+# ---------------------------------------------------------------------------
+# 站点区域归属
+# ---------------------------------------------------------------------------
+
+
+def region_api(client: TestClient, station: str, revision: int, segments: list[dict]):
+    return client.post(
+        f"/api/regions/{station}",
+        json={"revision": revision, "segments": segments},
+    )
+
+
+def seg(start: str, end: str, code: str) -> dict:
+    return {"start": start, "end": end, "region_code": code}
+
+
+def test_region_timeline_validation(client: TestClient):
+    v0 = client.get("/api/regions/54511").json()
+    assert v0["station_id"] == "54511" and v0["revision"] == 0
+    assert v0["segments"] == []
+
+    overlap = region_api(
+        client,
+        "54511",
+        0,
+        [
+            seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "A"),
+            seg("2026-01-31T00:00:00Z", "2026-03-01T00:00:00Z", "B"),
+        ],
+    )
+    assert overlap.status_code == 400
+    assert "重叠" in overlap.json()["detail"]
+    assert client.get("/api/regions/54511").json()["revision"] == 0
+
+    empty = region_api(
+        client, "54511", 0, [seg("2026-02-01T00:00:00Z", "2026-02-01T00:00:00Z", "A")]
+    )
+    assert empty.status_code == 400
+    reversed_ = region_api(
+        client, "54511", 0, [seg("2026-03-01T00:00:00Z", "2026-02-01T00:00:00Z", "A")]
+    )
+    assert reversed_.status_code == 400
+
+    too_many = region_api(
+        client,
+        "54511",
+        0,
+        [
+            seg(
+                f"2026-01-{i + 1:02d}T00:00:00Z",
+                f"2026-01-{i + 2:02d}T00:00:00Z",
+                "A",
+            )
+            for i in range(20)
+        ],
+    )
+    # 20 段本身合法；21 段才超限
+    assert too_many.status_code == 200, too_many.text
+    assert too_many.json()["revision"] == 1
+    assert len(too_many.json()["segments"]) == 20
+
+    over = region_api(
+        client,
+        "54511",
+        1,
+        [
+            seg(
+                f"2027-01-{i + 1:02d}T00:00:00Z",
+                f"2027-01-{i + 2:02d}T00:00:00Z",
+                "A",
+            )
+            for i in range(21)
+        ],
+    )
+    assert over.status_code == 400
+    assert "20" in over.json()["detail"]
+    assert client.get("/api/regions/54511").json()["revision"] == 1
+
+
+def test_region_timeline_adjacent_ranges_and_sorted(client: TestClient):
+    # 相邻（end == 下一段 start）不重叠；乱序输入按开始时刻排序
+    resp = region_api(
+        client,
+        "54511",
+        0,
+        [
+            seg("2026-03-01T00:00:00Z", "2026-04-01T00:00:00Z", "C"),
+            seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "A"),
+            seg("2026-02-01T00:00:00Z", "2026-03-01T00:00:00Z", "B"),
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["revision"] == 1
+    assert [s["region_code"] for s in body["segments"]] == ["A", "B", "C"]
+    assert body["segments"][0]["start"] == "2026-01-01T00:00:00Z"
+
+
+def test_batch_region_preview_matches_exact_instant_and_gaps_are_null(
+    client: TestClient, settings: Settings
+):
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    payload = csv_text(
+        ["station_id", "observed_at", "temp_c"],
+        [
+            ["54511", "2026-01-01T00:00:00Z", "1"],  # 区间起点（含）
+            ["54511", "2026-02-01T00:00:00Z", "2"],  # 区间终点（不含）→ 空档
+            ["54511", "2026-01-15T12:34:56Z", "3"],  # 区间内
+            ["54512", "2026-01-15T12:34:56Z", "4"],  # 该站无时间轴
+        ],
+    )
+    batch = client.post(
+        "/api/batches",
+        data={"version": v},
+        files={"file": ("a.csv", payload, "text/csv")},
+    ).json()
+    path = settings.parquet_dir / batch["file_name"]
+    before = file_digest(path)
+
+    saved = region_api(
+        client,
+        "54511",
+        0,
+        [seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "华北")],
+    )
+    assert saved.status_code == 200, saved.text
+
+    view = client.get(f"/api/batches/{batch['id']}").json()
+    assert view["region_column"] == "region_code"
+    assert view["region_codes"] == ["华北", None, "华北", None]
+    assert view["regions"]["54511"]["revision"] == 1
+    assert "54512" not in view["regions"]
+
+    csv_resp = client.get(f"/batches/{batch['id']}/download.csv")
+    assert csv_resp.status_code == 200
+    lines = csv_resp.text.splitlines()
+    assert lines[0] == "station_id,observed_at,temp_c,region_code"
+    assert lines[1] == "54511,2026-01-01T00:00:00Z,1,华北"
+    assert lines[2] == "54511,2026-02-01T00:00:00Z,2,"
+    assert lines[4] == "54512,2026-01-15T12:34:56Z,4,"
+
+    # 原 Parquet 字节不变，也没有 region_code 物理列
+    assert file_digest(path) == before
+    assert "region_code" not in pq.read_table(path).column_names
+
+    # 后续请求反映新归属
+    region_api(
+        client,
+        "54511",
+        1,
+        [seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "华东")],
+    )
+    assert client.get(f"/api/batches/{batch['id']}").json()["region_codes"][0] == "华东"
+    assert client.get(f"/batches/{batch['id']}/download.csv").text.splitlines()[1].endswith(
+        ",华东"
+    )
+
+
+def test_region_preview_uses_current_names_and_readd_null_rule(
+    client: TestClient, settings: Settings
+):
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    batch = client.post(
+        "/api/batches",
+        data={"version": v},
+        files={"file": ("a.csv", simple_csv(temp_c=5), "text/csv")},
+    ).json()
+    region_api(client, "54511", 0, [seg("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "A")])
+
+    field = current(client)["schema"]["fields"][0]
+    v = current(client)["schema"]["schema_version"]
+    client.patch(f"/api/fields/{field['id']}", json={"schema_version": v, "name": "temp_air"})
+    view = client.get(f"/api/batches/{batch['id']}").json()
+    assert view["columns"] == ["station_id", "observed_at", "temp_air"]
+    assert view["region_codes"] == ["A"]
+    csv_header = client.get(f"/batches/{batch['id']}/download.csv").text.splitlines()[0]
+    assert csv_header == "station_id,observed_at,temp_air,region_code"
+
+    v = current(client)["schema"]["schema_version"]
+    client.request("DELETE", f"/api/fields/{field['id']}", json={"schema_version": v})
+    v = current(client)["schema"]["schema_version"]
+    client.post("/api/fields", json={"schema_version": v, "name": "temp_air"})
+    view = client.get(f"/api/batches/{batch['id']}").json()
+    assert view["rows"][0][2] is None
+    assert view["region_codes"] == ["A"]
+
+
+def test_region_stale_revision_rejected_and_old_timeline_kept(client: TestClient):
+    first = region_api(
+        client, "54511", 0, [seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "A")]
+    )
+    assert first.status_code == 200
+    stale = region_api(
+        client, "54511", 0, [seg("2026-03-01T00:00:00Z", "2026-04-01T00:00:00Z", "B")]
+    )
+    assert stale.status_code == 409
+    payload = stale.json()
+    assert payload["error"] == "stale_region"
+    assert payload["expected_version"] == 0
+    assert payload["revision"] == 1
+    kept = client.get("/api/regions/54511").json()
+    assert kept["revision"] == 1
+    assert [s["region_code"] for s in kept["segments"]] == ["A"]
+
+    # 每站修订号独立
+    other = region_api(
+        client, "54512", 0, [seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "B")]
+    )
+    assert other.status_code == 200
+    assert other.json()["revision"] == 1
+    assert client.get("/api/regions/54511").json()["revision"] == 1
+
+
+def test_region_web_form_maintains_segments(client: TestClient):
+    page = client.get("/regions?station=54511")
+    assert page.status_code == 200
+    assert 'name="revision" value="0"' in page.text
+
+    saved = client.post(
+        "/regions",
+        data={
+            "station_id": "54511",
+            "revision": "0",
+            "start": ["2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", ""],
+            "end": ["2026-02-01T00:00:00Z", "2026-03-01T00:00:00Z", ""],
+            "region_code": ["A", "B", ""],
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    assert "r1" in saved.headers["location"]
+
+    page = client.get("/regions?station=54511")
+    assert page.status_code == 200
+    assert 'name="revision" value="1"' in page.text
+    assert 'value="2026-01-01T00:00:00Z"' in page.text
+    assert "当前已提交时间轴" in page.text
+
+    # 用页面上的旧修订号再次提交：整次拒绝且保留旧时间轴
+    stale = client.post(
+        "/regions",
+        data={
+            "station_id": "54511",
+            "revision": "0",
+            "start": "2026-03-01T00:00:00Z",
+            "end": "2026-04-01T00:00:00Z",
+            "region_code": "C",
+        },
+        follow_redirects=False,
+    )
+    assert stale.status_code == 409
+    assert "区域归属已过期" in stale.text
+    timeline = client.get("/api/regions/54511").json()
+    assert timeline["revision"] == 1
+    assert [s["region_code"] for s in timeline["segments"]] == ["A", "B"]
+
+    # 重叠提交在网页上回显错误并保留草稿
+    bad = client.post(
+        "/regions",
+        data={
+            "station_id": "54511",
+            "revision": "1",
+            "start": ["2026-01-15T00:00:00Z", "2026-01-20T00:00:00Z"],
+            "end": ["2026-03-01T00:00:00Z", "2026-04-01T00:00:00Z"],
+            "region_code": ["X", "Y"],
+        },
+        follow_redirects=False,
+    )
+    assert bad.status_code == 400
+    assert "重叠" in bad.text
+    assert 'value="X"' in bad.text
+    assert client.get("/api/regions/54511").json()["revision"] == 1
+
+    # 区间边界保留微秒，页面回填后可原样再提交
+    precise = client.post(
+        "/api/regions/54511",
+        json={
+            "revision": 1,
+            "segments": [seg("2026-01-01T00:00:00.500000Z", "2026-02-01T00:00:00Z", "M")],
+        },
+    )
+    assert precise.status_code == 200
+    page = client.get("/regions?station=54511")
+    assert 'value="2026-01-01T00:00:00.500000Z"' in page.text
+    roundtrip = client.post(
+        "/regions",
+        data={
+            "station_id": "54511",
+            "revision": "2",
+            "start": "2026-01-01T00:00:00.500000Z",
+            "end": "2026-02-01T00:00:00Z",
+            "region_code": "M",
+        },
+        follow_redirects=False,
+    )
+    assert roundtrip.status_code == 303
+    assert client.get("/api/regions/54511").json()["revision"] == 3
+
+
+def test_download_snapshot_mixes_neither_columns_nor_regions(
+    client: TestClient, settings: Settings
+):
+    """下载组装期间提交结构或区域修订，单次响应仍须来自同一已提交快照。"""
+
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    batch = client.post(
+        "/api/batches",
+        data={"version": v},
+        files={"file": ("a.csv", simple_csv(temp_c=11), "text/csv")},
+    ).json()
+    region_api(client, "54511", 0, [seg("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "旧区域")])
+    field_id = current(client)["schema"]["fields"][0]["id"]
+
+    original_utf8 = lake.csv_bytes
+    calls = {"n": 0}
+
+    def raced_csv_bytes(table):
+        # CSV 序列化发生在读事务结束之后；这里模拟另一实例在下载期间提交。
+        if calls["n"] == 0:
+            calls["n"] += 1
+            version = lake.read_schema(settings).version
+            lake.rename_field(settings, version, field_id, "temp_air")
+            lake.set_region_timeline(
+                settings,
+                "54511",
+                1,
+                [seg("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "新区域")],
+            )
+        return original_utf8(table)
+
+    import app.main as main_module
+
+    original = main_module.lake.csv_bytes
+    main_module.lake.csv_bytes = raced_csv_bytes
+    try:
+        resp = client.get(f"/api/batches/{batch['id']}?format=csv")
+    finally:
+        main_module.lake.csv_bytes = original
+
+    assert resp.status_code == 200, resp.text
+    lines = resp.text.splitlines()
+    assert lines[0] == "station_id,observed_at,temp_c,region_code"
+    assert lines[1] == "54511,2026-01-01T00:00:00Z,11,旧区域"
+
+    # 后续请求反映新列名与新归属
+    after = client.get(f"/api/batches/{batch['id']}?format=csv")
+    assert after.text.splitlines()[0] == "station_id,observed_at,temp_air,region_code"
+    assert after.text.splitlines()[1] == "54511,2026-01-01T00:00:00Z,11,新区域"
+
+
+def test_region_column_name_is_reserved(client: TestClient):
+    resp = add(client, "region_code")
+    assert resp.status_code == 400
+    assert "固定列" in resp.json()["detail"]
+
+    add(client, "temp_c")
+    v = current(client)["schema"]["schema_version"]
+    upload = client.post(
+        "/api/batches",
+        data={"version": v},
+        files={
+            "file": (
+                "a.csv",
+                csv_text(
+                    ["station_id", "observed_at", "temp_c", "region_code"],
+                    [["54511", "2026-01-01T00:00:00Z", "1", "A"]],
+                ),
+                "text/csv",
+            )
+        },
+    )
+    assert upload.status_code == 400
+    assert "region_code" in upload.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -699,3 +1080,145 @@ def test_two_processes_share_state_and_reject_stale_writes(dual_instances):
     assert stale.status_code == 409
     assert len(httpx.get(f"{b}/api/state").json()["batches"]) == 1
     assert len(list((data_dir / "parquet").glob("*.parquet"))) == 1
+
+
+def test_two_processes_region_revision_and_batch_assignment(dual_instances):
+    urls, data_dir = dual_instances
+    a, b = urls
+
+    assert httpx.post(f"{a}/api/fields", json={"schema_version": 0, "name": "temp_c"}).status_code == 201
+    upload = httpx.post(
+        f"{b}/api/batches",
+        data={"version": 1},
+        files={
+            "file": (
+                "a.csv",
+                csv_text(
+                    ["station_id", "observed_at", "temp_c"],
+                    [
+                        ["54511", "2026-01-01T00:00:00Z", "1"],
+                        ["54511", "2026-02-01T00:00:00Z", "2"],
+                    ],
+                ),
+                "text/csv",
+            )
+        },
+        timeout=30,
+    )
+    assert upload.status_code == 201, upload.text
+    batch_id = upload.json()["id"]
+
+    segments = [seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "华北")]
+    results: list[httpx.Response] = []
+
+    def attempt(url: str) -> None:
+        results.append(
+            httpx.post(
+                f"{url}/api/regions/54511",
+                json={"revision": 0, "segments": segments},
+                timeout=30,
+            )
+        )
+
+    left = threading.Thread(target=attempt, args=(a,))
+    right = threading.Thread(target=attempt, args=(b,))
+    left.start()
+    right.start()
+    left.join()
+    right.join()
+    codes = sorted(r.status_code for r in results)
+    assert codes == [200, 409], [r.text for r in results]
+    rejected = next(r for r in results if r.status_code == 409).json()
+    assert rejected["error"] == "stale_region"
+    assert rejected["revision"] == 1
+
+    # 两实例看到同一时间轴；旧时间轴未被失败提交改写
+    assert httpx.get(f"{a}/api/regions/54511").json() == httpx.get(
+        f"{b}/api/regions/54511"
+    ).json()
+    timeline = httpx.get(f"{a}/api/regions/54511").json()
+    assert timeline["revision"] == 1
+    assert [s["region_code"] for s in timeline["segments"]] == ["华北"]
+
+    # 批次预览 / CSV 在另一实例按相同归属匹配；空档为空
+    preview = httpx.get(f"{b}/api/batches/{batch_id}").json()
+    assert preview["region_codes"] == ["华北", None]
+    csv_resp = httpx.get(f"{a}/api/batches/{batch_id}?format=csv")
+    lines = csv_resp.text.splitlines()
+    assert lines[0] == "station_id,observed_at,temp_c,region_code"
+    assert lines[1].endswith(",华北") and lines[2].endswith(",")
+
+    # 用旧修订号在 B 修订：被拒，且 A 中的归属不变
+    stale = httpx.post(
+        f"{b}/api/regions/54511",
+        json={
+            "revision": 0,
+            "segments": [seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "已回退")],
+        },
+        timeout=30,
+    )
+    assert stale.status_code == 409
+    assert httpx.get(f"{a}/api/batches/{batch_id}").json()["region_codes"][0] == "华北"
+
+    # 下载期间另一实例仍可上传、改列与修订区域；下载快照不混合
+    field_id = httpx.get(f"{a}/api/schema").json()["fields"][0]["id"]
+    raced: list[httpx.Response] = []
+
+    def download() -> None:
+        raced.append(httpx.get(f"{a}/api/batches/{batch_id}?format=csv", timeout=30))
+
+    def mutate() -> None:
+        httpx.post(
+            f"{b}/api/batches",
+            data={"version": 1},
+            files={
+                "file": (
+                    "b.csv",
+                    csv_text(
+                        ["station_id", "observed_at", "temp_c"],
+                        [["54511", "2026-01-01T00:00:00Z", "3"]],
+                    ),
+                    "text/csv",
+                )
+            },
+            timeout=30,
+        )
+        httpx.patch(
+            f"{b}/api/fields/{field_id}",
+            json={"schema_version": 1, "name": "temp_air"},
+            timeout=30,
+        )
+        httpx.post(
+            f"{b}/api/regions/54511",
+            json={
+                "revision": 1,
+                "segments": [seg("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z", "华东")],
+            },
+            timeout=30,
+        )
+
+    t1 = threading.Thread(target=download)
+    t2 = threading.Thread(target=mutate)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert raced and raced[0].status_code == 200
+    lines = raced[0].text.splitlines()
+    assert len(lines) == 3
+    if "temp_air" in lines[0]:
+        assert lines[0] == "station_id,observed_at,temp_air,region_code"
+    else:
+        assert lines[0] == "station_id,observed_at,temp_c,region_code"
+    if "华东" in lines[1]:
+        assert "华北" not in lines[1]
+    else:
+        assert lines[1].endswith(",华北")
+
+    # 后续请求反映最新已提交归属与列名
+    after = httpx.get(f"{a}/api/batches/{batch_id}?format=csv").text.splitlines()
+    assert after[0] == "station_id,observed_at,temp_air,region_code"
+    assert after[1].endswith(",华东")
+    state = httpx.get(f"{a}/api/state").json()
+    assert len(state["batches"]) == 2
+    assert httpx.get(f"{a}/api/integrity").json()["ok"] is True

@@ -21,6 +21,10 @@
     本页基于快照 v{{ ack }}，当前已提交结构为 v{{ latest }}。刷新页面可获得最新视图；下载同样基于单次已提交快照。
   </div>
   {% endif %}
+  <div class="notice info">
+    页面预览与 CSV 下载都由同一次已提交读事务生成：批次登记、当前列名与站点区域时间轴
+    取自同一快照，不会混合新旧归属；刷新后即可反映新提交的区域修订。
+  </div>
 
   <section class="panel">
     <h2>批次信息</h2>
@@ -34,10 +38,54 @@
       <dt>展示快照</dt><dd>v{{ ack }}</dd>
     </dl>
     <div class="downloads">
-      <a href="/batches/{{ batch.id }}/download.csv">下载当前列名 CSV</a>
+      <a href="/batches/{{ batch.id }}/download.csv">下载含区域归属 CSV</a>
       <a href="/batches/{{ batch.id }}/download.parquet">下载当前列名 Parquet</a>
       <a href="/api/batches/{{ batch.id }}">JSON</a>
+      <a href="/regions">维护站点区域归属</a>
     </div>
+  </section>
+
+  <section class="panel">
+    <h2>
+      区域归属预览
+      <span class="badge gray">{{ region_column }}</span>
+    </h2>
+    <p class="hint" style="margin-top:-6px">
+      按每行的<strong>站号</strong>与该行<strong>精确 observed_at</strong> 匹配已提交的区域时间轴
+      （UTC 左闭右开）；落在区间空档或站点无时间轴时归空。区域归属不写入原 Parquet。
+    </p>
+    {% if regions %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th>站号</th>
+          <th>时间轴修订</th>
+          <th>本批行数</th>
+          <th>已归属</th>
+          <th>空档</th>
+          <th>区间段</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in regions %}
+        <tr>
+          <td><code>{{ item.station_id }}</code></td>
+          <td class="num">{% if item.revision is none %}<span class="muted">未维护</span>{% else %}r{{ item.revision }}{% endif %}</td>
+          <td class="num">{{ item.rows }}</td>
+          <td class="num">{{ item.assigned }}</td>
+          <td class="num">{{ item.unassigned }}</td>
+          <td class="muted">
+            {% for seg in item.segments %}
+            <span class="badge gray">{{ fmt_utc(seg.start) }} → {{ fmt_utc(seg.end) }} · {{ seg.region_code }}</span>
+            {% endfor %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">本批没有可匹配的站点行。</p>
+    {% endif %}
   </section>
 
   <section class="panel">

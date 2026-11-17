@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>站点区域归属 · 气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>站点区域归属</h1>
+  <span class="sub">按站号整批维护 UTC 左闭右开区间 [start, end) · 最多 {{ max_segments }} 段 · 区间不得重叠</span>
+  <span class="instance">实例 {{ settings.instance_name }} · 结构 v{{ ack }}</span>
+</header>
+
+<main>
+  <div class="crumbs"><a href="/">← 返回数据湖</a></div>
+  {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+
+  <div class="grid">
+    <div>
+      <section class="panel">
+        <h2>
+          维护时间轴
+          {% if selected %}
+          <span class="badge">修订 r{{ selected.revision }}</span>
+          {% else %}
+          <span class="badge gray">新站点</span>
+          {% endif %}
+        </h2>
+
+        <form class="stack-form" method="get" action="/regions">
+          <span class="grow">
+            <input type="text" name="station" value="{{ station or '' }}"
+                   placeholder="输入站号，如 54511" maxlength="256" required
+                   aria-label="站号">
+          </span>
+          <button class="secondary" type="submit">载入该站时间轴</button>
+        </form>
+
+        {% if station %}
+        <form method="post" action="/regions" id="region-form" style="margin-top:16px">
+          <input type="hidden" name="station_id" value="{{ station }}">
+          <input type="hidden" name="revision" value="{{ revision }}">
+
+          <div class="table-scroll" style="max-height:none">
+            <table class="data region-editor">
+              <thead>
+                <tr>
+                  <th style="width:36px">#</th>
+                  <th>开始 (UTC，含)</th>
+                  <th>结束 (UTC，不含)</th>
+                  <th>区域代码</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for seg in draft %}
+                <tr>
+                  <td class="muted num">{{ loop.index }}</td>
+                  <td><input type="text" name="start" value="{{ seg.start }}"
+                             placeholder="2026-01-01T00:00:00Z" aria-label="开始时刻"></td>
+                  <td><input type="text" name="end" value="{{ seg.end }}"
+                             placeholder="2026-02-01T00:00:00Z" aria-label="结束时刻"></td>
+                  <td><input type="text" name="region_code" value="{{ seg.region_code }}"
+                             placeholder="如 华北" maxlength="64" aria-label="区域代码"></td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="notice info">
+            整批提交：表单中所有非空行构成该站的完整时间轴，空档在批次预览中归属为空。
+            提交基于当前所见修订 <strong>r{{ revision }}</strong>；若另一实例已提交新修订，
+            本次整次拒绝且旧时间轴保持不变。区间按开始时刻自动排序；重叠或空区间会被拒绝。
+          </div>
+          <div class="downloads">
+            <button type="submit">提交该站区域归属</button>
+          </div>
+        </form>
+        {% else %}
+        <p class="muted" style="margin-top:14px">
+          先输入站号并载入；新站点从修订 r0 开始。每段填写开始、结束（UTC，ISO 8601）
+          与区域代码，留空行会被忽略。
+        </p>
+        {% endif %}
+      </section>
+
+      {% if selected and selected.segments %}
+      <section class="panel">
+        <h2>当前已提交时间轴 <span class="badge gray">r{{ selected.revision }}</span></h2>
+        <table class="data">
+          <thead>
+            <tr><th>#</th><th>开始 (UTC)</th><th>结束 (UTC)</th><th>区域代码</th></tr>
+          </thead>
+          <tbody>
+            {% for seg in selected.segments %}
+            <tr>
+              <td class="muted num">{{ loop.index }}</td>
+              <td class="num">{{ fmt_utc(seg.start) }}</td>
+              <td class="num">{{ fmt_utc(seg.end) }}</td>
+              <td><strong>{{ seg.region_code }}</strong></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+      {% endif %}
+    </div>
+
+    <div>
+      <section class="panel">
+        <h2>已维护站点 <span class="hint">共 {{ timelines|length }} 个</span></h2>
+        {% if timelines %}
+        <table class="data">
+          <thead>
+            <tr><th>站号</th><th>修订</th><th>段数</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for t in timelines %}
+            <tr>
+              <td><a href="/regions?station={{ t.station_id|urlencode }}"><code>{{ t.station_id }}</code></a></td>
+              <td class="num">r{{ t.revision }}</td>
+              <td class="num">{{ t.segment_count }}</td>
+              <td class="muted num">{{ t.updated_at }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="muted">还没有任何站点区域时间轴。</p>
+        {% endif %}
+        <div class="notice info">
+          区域归属不写入原 Parquet。批次预览与 CSV 下载按“站号 + 精确观测时刻”匹配，
+          沿用当前测量列名及同名重建补空规则。
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>API</h2>
+        <ul class="plain">
+          <li><code>GET /api/regions</code>：全部站点时间轴</li>
+          <li><code>GET /api/regions/{station}</code>：单站时间轴（无则 r0）</li>
+          <li><code>POST /api/regions/{station}</code>：
+            <code>{"revision": r, "segments": [{"start": "...Z", "end": "...Z", "region_code": "..."}]}</code></li>
+          <li>冲突返回 409 <code>stale_region</code>，旧时间轴不变。</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 区域时间轴独立于观测 Parquet；批次读取只做内存投影。
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

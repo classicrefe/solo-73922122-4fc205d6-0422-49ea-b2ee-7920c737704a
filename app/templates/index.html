@@ -113,7 +113,7 @@
               <td>
                 <div class="row-actions">
                   <a href="/batches/{{ batch.id }}">查看</a>
-                  <a href="/batches/{{ batch.id }}/download.csv">CSV</a>
+                  <a href="/batches/{{ batch.id }}/download.csv">CSV（含区域）</a>
                   <a href="/batches/{{ batch.id }}/download.parquet">Parquet</a>
                 </div>
               </td>
@@ -149,6 +149,22 @@
       </section>
 
       <section class="panel">
+        <h2>站点区域归属</h2>
+        <p class="hint" style="margin-top:-6px">
+          按站号整批维护 UTC 左闭右开有效区间与区域代码（最多 20 段，不得重叠）。
+          批次预览与 CSV 下载按站号 + 精确观测时刻匹配；原 Parquet 不改。
+        </p>
+        <dl class="meta">
+          <dt>已维护站点</dt><dd>{{ state.regions|length }}</dd>
+          <dt>维护方式</dt><dd>整站时间轴 + 修订号</dd>
+        </dl>
+        <div class="downloads">
+          <a href="/regions">维护 / 查看区域归属</a>
+          <a href="/api/regions">区域 API</a>
+        </div>
+      </section>
+
+      <section class="panel">
         <h2>结构版本与一致性</h2>
         <dl class="meta">
           <dt>页面快照版本</dt><dd>v{{ ack }}</dd>
@@ -174,6 +190,7 @@
           <li>改名：把 <code>temp_c</code> 改为 <code>temperature_c</code>，旧批次仍显示旧值。</li>
           <li>删除后同名新增：旧批次该列显示空值，不会串到新字段。</li>
           <li>打开两个浏览器标签（或两个实例端口）同时提交，可看到过期版本被拒绝。</li>
+          <li>区域归属：在“站点区域归属”页按站号维护 UTC 左闭右开区间；批次页按精确观测时刻预览，空档为空。</li>
         </ul>
       </section>
     </div>
